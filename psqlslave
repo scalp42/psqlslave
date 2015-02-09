@@ -1,0 +1,137 @@
+#!/bin/bash
+##This is meant to be run on the slave
+master=$1
+pgpool="replace this with ip of pgpool node"
+datadir=/var/lib/postgresql/9.3/main
+archivedir=/var/lib/postgresql/9.3/archive
+archivedirdest=/var/lib/postgresql/9.3/archive
+
+Whoami () {
+if [[ $(whoami) != "postgres" ]]
+then
+      echo "This script must be run as user postgres, and passwordless ssh must already be setup"
+      exit 1
+fi
+}
+CheckIfPostgresIsRunningOnRemoteHost () {
+isrunning="$(ssh postgres@"$master" 'if killall -0 postgres; then echo "postgres_running"; else echo "postgress_not_running"; fi;')"
+
+if [[ "$isrunning" = "postgress_not_running" ]]
+then
+        echo "PostgreSQL not running on the Master, Exiting";
+        exit 1
+
+elif [[ "$isrunning" = "postgres_running" ]]
+then
+        echo "PostgreSQL running on Master";
+
+elif echo "ERROR [001] :  Unexpected Response, Exiting"
+then
+        exit 1
+fi
+}
+
+CheckIfMasterIsActuallyAMaster () {
+ismaster="$(ssh postgres@"$master" 'if [ -f /var/lib/postgresql/9.1/main/recovery.done ]; then echo "postgres_is_a_master_instance"; else echo "postgres_is_not_master"; fi;')"
+
+if [[ "$ismaster" = "postgres_is_not_master" ]]
+then
+        echo "Master instance is already slave or recovery.done file missing, Exiting";
+        exit 1
+
+elif [[ "$ismaster" = "postgres_is_a_master_instance" ]]
+then
+       echo "PostgreSQL is running as a Master (probably)";
+
+elif echo "ERROR [002] :  Unexpected Response, Exiting"
+then
+        exit 1
+
+fi
+}
+
+echo "All Sanity checks passed executing rest of script"
+
+PrepareLocalServer () {
+
+if [[ -f "/tmp/pgsql.trigger" ]]
+then
+        rm /tmp/pgsql.trigger
+fi
+
+bash /etc/init.d/postgresql stop
+
+if [[ -f "$datadir/recovery.done" ]];
+then
+        mv $datadir/recovery.done $datadir/recovery.conf
+fi
+}
+
+
+CheckForRecoveryConfig () {
+if [[ -f "$datadir/recovery.conf" ]];
+    then
+        echo "Slave Config File Found, Continuing"
+    else
+        echo "recovery.conf not found Postgres Cannot Become a Slave, Exiting"
+        exit 1
+fi
+}
+
+
+
+
+PutMasterIntoBackupMode () {
+dt=$(date +%Y%m%d%H%M)
+mkdir /var/lib/postgresql/9.1/archive.$dt
+mv /var/lib/postgresql/9.1/archive/* /var/lib/postgresql/9.1/archive.$dt/
+ssh postgres@$master "touch /var/lib/postgresql/9.1/archiving_active;psql -c \"SELECT pg_start_backup('Streaming Replication', true)\" postgres"
+}
+
+
+RsyncWhileLive() {
+rsync -C -av --delete -e ssh --exclude recovery.conf --exclude recovery.done --exclude postmaster.pid  --exclude pg_xlog/ --exclude server.crt --exclude server.key $master:$datadir/ $datadir/
+}
+
+
+
+StopBackupModeAndArchiveIntoWallLog () {
+ssh postgres@$master "psql -c \"SELECT pg_stop_backup()\" postgres"
+rsync -C -a -e ssh $master:$archivedir/ $archivedirdest/
+}
+
+
+
+StopPostgreSqlAndFinishRsync () {
+ssh postgres@$master "/etc/init.d/postgresql stop"
+rsync -av --delete  -e ssh $master:$datadir/pg_xlog/ $datadir/pg_xlog/
+}
+
+
+StartLocalAndThenRemotePostGreSql () {
+/etc/init.d/postgresql start
+ssh postgres@$master "/etc/init.d/postgresql start"
+}
+
+
+
+
+Whoami
+CheckIfPostgresIsRunningOnRemoteHost "$master"
+CheckIfMasterIsActuallyAMaster "$master"
+PrepareLocalServer "$datadir"
+CheckForRecoveryConfig "$datadir"
+PutMasterIntoBackupMode "$master"
+RsyncWhileLive "$master"
+StopBackupModeAndArchiveIntoWallLog "$master" "$archivedir" "$archivedirdest"
+StopPostgreSqlAndFinishRsync "$master"
+StartLocalAndThenRemotePostGreSql "$master"
+
+
+echo "Please wait.. Re-Attaching Node to Pgpool"
+sleep 15
+echo "Attaching Master Node"
+ssh -T $pgpool "/usr/sbin/pcp_attach_node 10 localhost 9898 pgpool pgp00l@007 0"
+sleep 3
+echo "Attaching Slave Node"
+ssh -T $pgpool "/usr/sbin/pcp_attach_node 10 localhost 9898 pgpool pgp00l@007 1"
