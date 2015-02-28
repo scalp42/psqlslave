@@ -1,5 +1,5 @@
-Postgres-streaming-replication-script
-=====================================
+Postgres Streaming Replication Script - PgPool 2 
+================================================
 
 Usage
 -----
